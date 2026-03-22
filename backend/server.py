@@ -8,94 +8,75 @@ import traceback
 app = Flask(__name__)
 CORS(app)
 
-# ── yt-dlp options ────────────────────────────────────────────────────
-# These options help bypass YouTube bot detection on cloud servers
+# Force audio-only formats, prefer opus/m4a which browsers handle well
+AUDIO_FORMATS = 'bestaudio[ext=webm][acodec=opus]/bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio'
 
-BASE_OPTS = {
-    'quiet': True,
-    'no_warnings': True,
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'web'],
-        }
+STRATEGY_OPTS = [
+    {
+        'quiet': True, 'no_warnings': True,
+        'format': AUDIO_FORMATS,
+        'extractor_args': {'youtube': {'player_client': ['android_vr']}},
     },
-}
+    {
+        'quiet': True, 'no_warnings': True,
+        'format': AUDIO_FORMATS,
+        'extractor_args': {'youtube': {'player_client': ['android']}},
+    },
+    {
+        'quiet': True, 'no_warnings': True,
+        'format': AUDIO_FORMATS,
+        'extractor_args': {'youtube': {'player_client': ['tv_embedded']}},
+    },
+    {
+        'quiet': True, 'no_warnings': True,
+        'format': AUDIO_FORMATS,
+    },
+]
 
-SEARCH_OPTS = {
-    **BASE_OPTS,
-    'extract_flat': True,
-    'playlistend': 20,
-}
-
-STREAM_OPTS = {
-    **BASE_OPTS,
-    'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
-}
-
-
-def get_best_audio(vid_id):
-    """Extract best audio URL for a video ID. Tries multiple strategies."""
-
-    strategies = [
-        # Strategy 1: android client (most reliable on servers)
-        {
-            **STREAM_OPTS,
-            'extractor_args': {'youtube': {'player_client': ['android']}},
-        },
-        # Strategy 2: web client
-        {
-            **STREAM_OPTS,
-            'extractor_args': {'youtube': {'player_client': ['web']}},
-        },
-        # Strategy 3: mweb client
-        {
-            **STREAM_OPTS,
-            'extractor_args': {'youtube': {'player_client': ['mweb']}},
-        },
-    ]
-
-    last_error = None
-    for opts in strategies:
+def get_audio(vid_id):
+    errors = []
+    for i, opts in enumerate(STRATEGY_OPTS):
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(
                     f"https://www.youtube.com/watch?v={vid_id}",
                     download=False
                 )
-                formats = info.get('formats', [])
+                fmts = info.get('formats', [])
 
-                audio_only = [
-                    f for f in formats
-                    if f.get('vcodec') == 'none'
-                    and f.get('acodec') != 'none'
+                # Strictly audio only — no video codec
+                audio = [
+                    f for f in fmts
+                    if f.get('vcodec') in ('none', None, '')
+                    and f.get('acodec') not in ('none', None, '')
                     and f.get('url')
                 ]
-                if not audio_only:
-                    audio_only = [f for f in formats if f.get('url')]
+                if not audio:
+                    audio = [f for f in fmts if f.get('url')]
 
-                if not audio_only:
+                if not audio:
+                    errors.append(f"Strategy {i+1}: no formats")
                     continue
 
-                best = sorted(
-                    audio_only,
-                    key=lambda f: f.get('abr') or 0,
-                    reverse=True
-                )[0]
+                best = sorted(audio, key=lambda f: f.get('abr') or 0, reverse=True)[0]
 
+                print(f"✅ Strategy {i+1} OK | ext={best.get('ext')} acodec={best.get('acodec')} abr={best.get('abr')}")
                 return best, info
+
         except Exception as e:
-            last_error = e
-            continue
+            errors.append(f"Strategy {i+1}: {e}")
+            print(f"❌ Strategy {i+1} failed: {e}")
 
-    raise Exception(f"All strategies failed. Last error: {last_error}")
+    raise Exception("All strategies failed:\n" + "\n".join(errors))
 
 
-# ── Routes ────────────────────────────────────────────────────────────
+@app.route('/')
+def index():
+    return jsonify({'status': 'ok', 'message': 'FreeBeat API'})
 
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok', 'yt_dlp': yt_dlp.version.__version__})
-
 
 @app.route('/search')
 def search():
@@ -103,22 +84,27 @@ def search():
     if not q:
         return jsonify([])
     try:
-        with yt_dlp.YoutubeDL(SEARCH_OPTS) as ydl:
+        opts = {
+            'quiet': True, 'no_warnings': True,
+            'extract_flat': True, 'playlistend': 20,
+            'extractor_args': {'youtube': {'player_client': ['android_vr', 'android']}},
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch20:{q} music", download=False)
             results = []
             for entry in info.get('entries', []):
-                duration = entry.get('duration') or 0
-                if duration > 600:
+                dur = entry.get('duration') or 0
+                if dur > 600:
                     continue
                 vid_id = entry.get('id', '')
                 results.append({
                     'id':       vid_id,
                     'title':    entry.get('title', ''),
                     'channel':  entry.get('uploader') or entry.get('channel', ''),
-                    'duration': duration,
+                    'duration': dur,
                     'thumb':    f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg",
                 })
-            return jsonify(results[:15])
+        return jsonify(results[:15])
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -130,13 +116,20 @@ def stream():
     if not vid_id:
         return jsonify({'error': 'no id'}), 400
     try:
-        _, info = get_best_audio(vid_id)
+        best, info = get_audio(vid_id)
+
+        ext      = best.get('ext', 'webm')
+        acodec   = best.get('acodec', '')
+        ct_map   = {'webm': 'audio/webm', 'm4a': 'audio/mp4', 'mp4': 'audio/mp4', 'ogg': 'audio/ogg', 'opus': 'audio/ogg'}
+        content_type = ct_map.get(ext, 'audio/webm')
+
         return jsonify({
-            'title':    info.get('title', ''),
-            'channel':  info.get('uploader', ''),
-            'thumb':    info.get('thumbnail', ''),
-            'duration': info.get('duration', 0),
-            'url':      f"/proxy?id={vid_id}",
+            'title':        info.get('title', ''),
+            'channel':      info.get('uploader', ''),
+            'thumb':        info.get('thumbnail', ''),
+            'duration':     info.get('duration', 0),
+            'url':          f"/proxy?id={vid_id}",
+            'content_type': content_type,
         })
     except Exception as e:
         traceback.print_exc()
@@ -145,33 +138,16 @@ def stream():
 
 @app.route('/proxy')
 def proxy():
-    """Stream audio through backend — fixes YouTube IP binding issue."""
     vid_id = request.args.get('id', '').strip()
     if not vid_id:
         return jsonify({'error': 'no id'}), 400
-
     try:
-        best, _ = get_best_audio(vid_id)
-        yt_url = best['url']
-        audio_ext = best.get('audio_ext') or best.get('ext', 'webm')
+        best, _ = get_audio(vid_id)
+        yt_url   = best['url']
+        ext      = best.get('ext', 'webm')
+        acodec   = best.get('acodec', '')
 
-        headers = {
-            'User-Agent': (
-                'Mozilla/5.0 (Linux; Android 10; SM-G981B) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/80.0.3987.162 Mobile Safari/537.36'
-            ),
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.youtube.com/',
-            'Origin': 'https://www.youtube.com',
-        }
-
-        range_header = request.headers.get('Range')
-        if range_header:
-            headers['Range'] = range_header
-
-        r = requests.get(yt_url, headers=headers, stream=True, timeout=30)
+        print(f"🔊 Proxying | ext={ext} | acodec={acodec} | url={yt_url[:80]}...")
 
         ct_map = {
             'webm': 'audio/webm',
@@ -180,25 +156,39 @@ def proxy():
             'ogg':  'audio/ogg',
             'opus': 'audio/ogg',
         }
-        content_type = ct_map.get(audio_ext, 'audio/webm')
+        content_type = ct_map.get(ext, 'audio/webm')
 
-        response_headers = {
+        req_headers = {
+            'User-Agent': 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Origin':  'https://www.youtube.com',
+            'Referer': 'https://www.youtube.com/',
+        }
+        if request.headers.get('Range'):
+            req_headers['Range'] = request.headers.get('Range')
+
+        r = requests.get(yt_url, headers=req_headers, stream=True, timeout=30)
+
+        print(f"📡 YouTube response: {r.status_code} | Content-Type: {r.headers.get('Content-Type','?')}")
+
+        resp_headers = {
             'Content-Type':                content_type,
             'Accept-Ranges':               'bytes',
             'Cache-Control':               'no-cache',
             'Access-Control-Allow-Origin': '*',
+            'X-Content-Type-Options':      'nosniff',
         }
         if 'Content-Length' in r.headers:
-            response_headers['Content-Length'] = r.headers['Content-Length']
+            resp_headers['Content-Length'] = r.headers['Content-Length']
         if 'Content-Range' in r.headers:
-            response_headers['Content-Range'] = r.headers['Content-Range']
+            resp_headers['Content-Range'] = r.headers['Content-Range']
 
         return Response(
             stream_with_context(r.iter_content(chunk_size=16384)),
             status=r.status_code,
-            headers=response_headers
+            headers=resp_headers
         )
-
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -206,6 +196,5 @@ def proxy():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    print(f"🎵 FreeBeat running on port {port}")
-    print(f"   yt-dlp version: {yt_dlp.version.__version__}")
+    print(f"🎵 FreeBeat on port {port} | yt-dlp {yt_dlp.version.__version__}")
     app.run(host='0.0.0.0', port=port, debug=False)

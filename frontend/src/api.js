@@ -1,8 +1,6 @@
 import axios from 'axios'
 
-// Hardcoded for now to confirm deployment works
-// We'll switch back to env variable once confirmed
-export const BASE = 'https://freebeat.onrender.com'
+export const BASE = import.meta.env.VITE_API_URL || 'http://localhost:8080'
 
 export const searchTracks = (q) =>
   axios.get(`${BASE}/search`, { params: { q } }).then(r => r.data)
