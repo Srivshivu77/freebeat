@@ -1,82 +1,122 @@
 from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
-import yt_dlp
+from Crypto.Cipher import DES
+import base64
 import requests
 import os
 import traceback
+import re
 
 app = Flask(__name__)
 CORS(app)
 
-# Force audio-only formats, prefer opus/m4a which browsers handle well
-AUDIO_FORMATS = 'bestaudio[ext=webm][acodec=opus]/bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio'
+SAAVN   = "https://www.jiosaavn.com/api.php"
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept':     'application/json, text/plain, */*',
+    'Referer':    'https://www.jiosaavn.com/',
+}
 
-STRATEGY_OPTS = [
-    {
-        'quiet': True, 'no_warnings': True,
-        'format': AUDIO_FORMATS,
-        'extractor_args': {'youtube': {'player_client': ['android_vr']}},
-    },
-    {
-        'quiet': True, 'no_warnings': True,
-        'format': AUDIO_FORMATS,
-        'extractor_args': {'youtube': {'player_client': ['android']}},
-    },
-    {
-        'quiet': True, 'no_warnings': True,
-        'format': AUDIO_FORMATS,
-        'extractor_args': {'youtube': {'player_client': ['tv_embedded']}},
-    },
-    {
-        'quiet': True, 'no_warnings': True,
-        'format': AUDIO_FORMATS,
-    },
-]
+# ── JioSaavn DES decryption ───────────────────────────────────────────
+# JioSaavn encrypts media URLs with DES ECB using this known key
+DES_KEY = b'38346591'
 
-def get_audio(vid_id):
-    errors = []
-    for i, opts in enumerate(STRATEGY_OPTS):
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(
-                    f"https://www.youtube.com/watch?v={vid_id}",
-                    download=False
-                )
-                fmts = info.get('formats', [])
+def decrypt_url(encrypted: str) -> str:
+    """Decrypt JioSaavn's encrypted_media_url using DES ECB."""
+    # The encrypted string is base64 encoded
+    # JioSaavn uses a custom base64 alphabet — replace chars first
+    enc = encrypted.replace('_', '/').replace('-', '+').replace(' ', '+')
 
-                # Strictly audio only — no video codec
-                audio = [
-                    f for f in fmts
-                    if f.get('vcodec') in ('none', None, '')
-                    and f.get('acodec') not in ('none', None, '')
-                    and f.get('url')
-                ]
-                if not audio:
-                    audio = [f for f in fmts if f.get('url')]
+    # Pad to multiple of 4
+    enc += '=' * (4 - len(enc) % 4)
 
-                if not audio:
-                    errors.append(f"Strategy {i+1}: no formats")
-                    continue
+    raw = base64.b64decode(enc)
+    cipher = DES.new(DES_KEY, DES.MODE_ECB)
+    decrypted = cipher.decrypt(raw)
 
-                best = sorted(audio, key=lambda f: f.get('abr') or 0, reverse=True)[0]
+    # Remove PKCS5 padding
+    pad = decrypted[-1]
+    if isinstance(pad, int) and 1 <= pad <= 8:
+        decrypted = decrypted[:-pad]
 
-                print(f"✅ Strategy {i+1} OK | ext={best.get('ext')} acodec={best.get('acodec')} abr={best.get('abr')}")
-                return best, info
+    url = decrypted.decode('utf-8', errors='ignore').strip()
 
-        except Exception as e:
-            errors.append(f"Strategy {i+1}: {e}")
-            print(f"❌ Strategy {i+1} failed: {e}")
+    # Upgrade to 320kbps
+    url = url.replace('_96.mp4',  '_320.mp4')
+    url = url.replace('_160.mp4', '_320.mp4')
+    url = url.replace('_48.mp4',  '_320.mp4')
+    url = url.replace('_96.mp3',  '_320.mp3')
+    url = url.replace('_160.mp3', '_320.mp3')
 
-    raise Exception("All strategies failed:\n" + "\n".join(errors))
+    return url
 
+
+def clean(text):
+    if not text:
+        return ''
+    text = re.sub(r'&quot;', '"',  text)
+    text = re.sub(r'&amp;',  '&',  text)
+    text = re.sub(r'&lt;',   '<',  text)
+    text = re.sub(r'&gt;',   '>',  text)
+    text = re.sub(r'&#039;', "'",  text)
+    text = re.sub(r'<[^>]+>', '',  text)
+    return text.strip()
+
+def hi_res(url):
+    if not url:
+        return ''
+    return url.replace('50x50','500x500').replace('150x150','500x500')
+
+def get_artists(song):
+    more_info  = song.get('more_info', {})
+    artist_map = more_info.get('artistMap', {})
+    primary    = artist_map.get('primary_artists', [])
+    if primary:
+        return ', '.join(a['name'] for a in primary if a.get('name'))
+    subtitle = clean(song.get('subtitle', ''))
+    return subtitle.split(' - ')[0].strip() if ' - ' in subtitle else subtitle
+
+def get_song_from_raw(raw):
+    if isinstance(raw, dict):
+        songs = raw.get('songs', [])
+        if songs and isinstance(songs, list):
+            return songs[0]
+    return None
+
+def fetch_song(song_id):
+    r = requests.get(SAAVN, params={
+        '__call':      'song.getDetails',
+        'pids':        song_id,
+        '_format':     'json',
+        '_marker':     '0',
+        'api_version': '4',
+        'ctx':         'wap6dot0',
+    }, headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    song = get_song_from_raw(r.json())
+    if not song:
+        raise Exception("Song not found")
+    return song
+
+def get_stream_url(song):
+    more_info = song.get('more_info', {})
+    encrypted = more_info.get('encrypted_media_url', '')
+    if not encrypted:
+        raise Exception("No encrypted_media_url found")
+    url = decrypt_url(encrypted)
+    print(f"🔓 Decrypted URL: {url[:80]}...")
+    return url
+
+
+# ── Routes ────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'message': 'FreeBeat API'})
+    return jsonify({'status': 'ok', 'source': 'jiosaavn'})
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok', 'yt_dlp': yt_dlp.version.__version__})
+    return jsonify({'status': 'ok', 'source': 'jiosaavn'})
 
 @app.route('/search')
 def search():
@@ -84,109 +124,102 @@ def search():
     if not q:
         return jsonify([])
     try:
-        opts = {
-            'quiet': True, 'no_warnings': True,
-            'extract_flat': True, 'playlistend': 20,
-            'extractor_args': {'youtube': {'player_client': ['android_vr', 'android']}},
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch20:{q} music", download=False)
-            results = []
-            for entry in info.get('entries', []):
-                dur = entry.get('duration') or 0
-                if dur > 600:
-                    continue
-                vid_id = entry.get('id', '')
-                results.append({
-                    'id':       vid_id,
-                    'title':    entry.get('title', ''),
-                    'channel':  entry.get('uploader') or entry.get('channel', ''),
-                    'duration': dur,
-                    'thumb':    f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg",
-                })
-        return jsonify(results[:15])
+        r = requests.get(SAAVN, params={
+            '__call':      'search.getResults',
+            'q':           q,
+            '_format':     'json',
+            '_marker':     '0',
+            'api_version': '4',
+            'ctx':         'wap6dot0',
+            'n':           '20',
+            'p':           '1',
+        }, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data    = r.json()
+        results = data.get('results', [])
+        songs   = []
+        for s in results:
+            if s.get('type') != 'song':
+                continue
+            sid = s.get('id', '')
+            if not sid:
+                continue
+            duration = 0
+            try:
+                duration = int(s.get('more_info', {}).get('duration', 0))
+            except:
+                pass
+            songs.append({
+                'id':       sid,
+                'title':    clean(s.get('title', '')),
+                'channel':  get_artists(s),
+                'duration': duration,
+                'thumb':    hi_res(s.get('image', '')),
+            })
+        return jsonify(songs[:15])
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/stream')
 def stream():
-    vid_id = request.args.get('id', '').strip()
-    if not vid_id:
+    song_id = request.args.get('id', '').strip()
+    if not song_id:
         return jsonify({'error': 'no id'}), 400
     try:
-        best, info = get_audio(vid_id)
-
-        ext      = best.get('ext', 'webm')
-        acodec   = best.get('acodec', '')
-        ct_map   = {'webm': 'audio/webm', 'm4a': 'audio/mp4', 'mp4': 'audio/mp4', 'ogg': 'audio/ogg', 'opus': 'audio/ogg'}
-        content_type = ct_map.get(ext, 'audio/webm')
-
+        song       = fetch_song(song_id)
+        stream_url = get_stream_url(song)  # validate decryption works
+        duration   = 0
+        try:
+            duration = int(song.get('more_info', {}).get('duration', 0))
+        except:
+            pass
         return jsonify({
-            'title':        info.get('title', ''),
-            'channel':      info.get('uploader', ''),
-            'thumb':        info.get('thumbnail', ''),
-            'duration':     info.get('duration', 0),
-            'url':          f"/proxy?id={vid_id}",
-            'content_type': content_type,
+            'title':    clean(song.get('title', '')),
+            'channel':  get_artists(song),
+            'thumb':    hi_res(song.get('image', '')),
+            'duration': duration,
+            'url':      f"/proxy?id={song_id}",
         })
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/proxy')
 def proxy():
-    vid_id = request.args.get('id', '').strip()
-    if not vid_id:
+    song_id = request.args.get('id', '').strip()
+    if not song_id:
         return jsonify({'error': 'no id'}), 400
     try:
-        best, _ = get_audio(vid_id)
-        yt_url   = best['url']
-        ext      = best.get('ext', 'webm')
-        acodec   = best.get('acodec', '')
+        song       = fetch_song(song_id)
+        stream_url = get_stream_url(song)
 
-        print(f"🔊 Proxying | ext={ext} | acodec={acodec} | url={yt_url[:80]}...")
-
-        ct_map = {
-            'webm': 'audio/webm',
-            'm4a':  'audio/mp4',
-            'mp4':  'audio/mp4',
-            'ogg':  'audio/ogg',
-            'opus': 'audio/ogg',
-        }
-        content_type = ct_map.get(ext, 'audio/webm')
+        print(f"🔊 Proxying: {stream_url[:80]}...")
 
         req_headers = {
-            'User-Agent': 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip',
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Origin':  'https://www.youtube.com',
-            'Referer': 'https://www.youtube.com/',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept':     '*/*',
+            'Referer':    'https://www.jiosaavn.com/',
         }
         if request.headers.get('Range'):
-            req_headers['Range'] = request.headers.get('Range')
+            req_headers['Range'] = request.headers['Range']
 
-        r = requests.get(yt_url, headers=req_headers, stream=True, timeout=30)
-
-        print(f"📡 YouTube response: {r.status_code} | Content-Type: {r.headers.get('Content-Type','?')}")
+        sr = requests.get(stream_url, headers=req_headers, stream=True, timeout=30)
 
         resp_headers = {
-            'Content-Type':                content_type,
+            'Content-Type':                'audio/mpeg',
             'Accept-Ranges':               'bytes',
             'Cache-Control':               'no-cache',
             'Access-Control-Allow-Origin': '*',
-            'X-Content-Type-Options':      'nosniff',
         }
-        if 'Content-Length' in r.headers:
-            resp_headers['Content-Length'] = r.headers['Content-Length']
-        if 'Content-Range' in r.headers:
-            resp_headers['Content-Range'] = r.headers['Content-Range']
+        if 'Content-Length' in sr.headers:
+            resp_headers['Content-Length'] = sr.headers['Content-Length']
+        if 'Content-Range' in sr.headers:
+            resp_headers['Content-Range'] = sr.headers['Content-Range']
 
         return Response(
-            stream_with_context(r.iter_content(chunk_size=16384)),
-            status=r.status_code,
+            stream_with_context(sr.iter_content(chunk_size=16384)),
+            status=sr.status_code,
             headers=resp_headers
         )
     except Exception as e:
@@ -196,5 +229,5 @@ def proxy():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    print(f"🎵 FreeBeat on port {port} | yt-dlp {yt_dlp.version.__version__}")
+    print(f"🎵 FreeBeat (JioSaavn) on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
